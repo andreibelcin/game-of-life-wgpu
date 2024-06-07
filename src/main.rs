@@ -1,18 +1,35 @@
-use std::sync::Arc;
+use std::{
+    ops::BitXor,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
+use rand::prelude::*;
+use vertex::{create_vertex_buffer, get_vertex_buffer_layout, VERTICES};
 use wgpu::{
-    Color, CommandEncoderDescriptor, Device, DeviceDescriptor, Instance, InstanceDescriptor,
-    Operations, Queue, RenderPassColorAttachment, RenderPassDescriptor, RequestAdapterOptions,
-    Surface, SurfaceConfiguration, SurfaceError, TextureUsages, TextureViewDescriptor,
+    core::binding_model::BindGroupLayout,
+    include_wgsl,
+    util::{BufferInitDescriptor, DeviceExt},
+    BindGroup, BindGroupDescriptor, BindGroupEntry, BindGroupLayoutDescriptor,
+    BindGroupLayoutEntry, BindingResource, BindingType, BlendState, Buffer, BufferDescriptor,
+    BufferUsages, Color, ColorTargetState, ColorWrites, CommandEncoderDescriptor,
+    ComputePassDescriptor, ComputePipeline, ComputePipelineDescriptor, Device, DeviceDescriptor,
+    FragmentState, Instance, InstanceDescriptor, MultisampleState, Operations,
+    PipelineCompilationOptions, PipelineLayout, PipelineLayoutDescriptor, PrimitiveState, Queue,
+    RenderPassColorAttachment, RenderPassDescriptor, RenderPipeline, RenderPipelineDescriptor,
+    RequestAdapterOptions, ShaderStages, Surface, SurfaceConfiguration, SurfaceError,
+    TextureUsages, TextureViewDescriptor, VertexState,
 };
 use winit::{
     application::ApplicationHandler,
     dpi::PhysicalSize,
-    event::{KeyEvent, WindowEvent},
+    event::{ElementState, KeyEvent, MouseButton, WindowEvent},
     event_loop::{ActiveEventLoop, ControlFlow, EventLoop},
     keyboard::{Key, NamedKey},
     window::{Window, WindowId},
 };
+
+mod vertex;
 
 fn initialise_webgpu<'a>(
     window: Arc<Window>,
@@ -64,20 +81,198 @@ enum StateError {
 }
 
 struct State<'a> {
+    // Window
+    window: Arc<Window>,
+    // WebGPU components
     surface: Surface<'a>,
     surface_config: SurfaceConfiguration,
-    window: Arc<Window>,
     device: Device,
     queue: Queue,
+    // Render pipeline
+    vertex_buffer: Buffer,
+    bind_groups: [BindGroup; 2],
+    cell_pipeline: RenderPipeline,
+    simulation_pipeline: ComputePipeline,
+    // Other
     size: PhysicalSize<u32>,
     clear_color: Color,
+    grid_size: usize,
+    selected_bind: usize,
+    last_time: Instant,
+    compute_delay: Duration,
 }
 
 impl<'a> State<'a> {
     fn new(window: Arc<Window>) -> Result<Self, StateError> {
         let size = window.inner_size();
+        let grid_size = 512;
 
         let (surface, surface_config, device, queue) = initialise_webgpu(window.clone())?;
+
+        let vertex_buffer =
+            create_vertex_buffer(&device, (VERTICES.len() * std::mem::size_of::<f32>()) as _);
+        queue.write_buffer(&vertex_buffer, 0, bytemuck::cast_slice(&VERTICES));
+
+        let vertex_buffer_layout = get_vertex_buffer_layout();
+
+        let uniform_array = [grid_size as f32; 2];
+        let uniform_buffer = device.create_buffer_init(&BufferInitDescriptor {
+            label: None,
+            contents: bytemuck::cast_slice(&uniform_array),
+            usage: BufferUsages::UNIFORM | BufferUsages::COPY_DST,
+        });
+
+        let mut cell_states = vec![0.0f32; grid_size * grid_size];
+        let cell_states_buffers = [
+            device.create_buffer(&BufferDescriptor {
+                label: None,
+                size: (cell_states.len() * std::mem::size_of::<f32>()) as _,
+                usage: BufferUsages::STORAGE | BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            }),
+            device.create_buffer(&BufferDescriptor {
+                label: None,
+                size: (cell_states.len() * std::mem::size_of::<f32>()) as _,
+                usage: BufferUsages::STORAGE | BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            }),
+        ];
+
+        let mut rng = rand::thread_rng();
+        for i in 0..cell_states.len() {
+            cell_states[i] = if rng.gen::<f32>() > 0.6 { 1.0 } else { 0.0 };
+        }
+        queue.write_buffer(
+            &cell_states_buffers[0],
+            0,
+            bytemuck::cast_slice(&cell_states),
+        );
+
+        let shader = device.create_shader_module(include_wgsl!("shader.wgsl"));
+        let simulator = device.create_shader_module(include_wgsl!("compute.wgsl"));
+
+        let bind_group_layout = device.create_bind_group_layout(&BindGroupLayoutDescriptor {
+            label: None,
+            entries: &[
+                BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: ShaderStages::VERTEX | ShaderStages::COMPUTE,
+                    ty: BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: ShaderStages::VERTEX | ShaderStages::COMPUTE,
+                    ty: BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: ShaderStages::COMPUTE,
+                    ty: BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: false },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+            ],
+        });
+        let bind_groups = [
+            device.create_bind_group(&BindGroupDescriptor {
+                label: None,
+                layout: &bind_group_layout,
+                entries: &[
+                    BindGroupEntry {
+                        binding: 0,
+                        resource: BindingResource::Buffer(
+                            uniform_buffer.as_entire_buffer_binding(),
+                        ),
+                    },
+                    BindGroupEntry {
+                        binding: 1,
+                        resource: BindingResource::Buffer(
+                            cell_states_buffers[0].as_entire_buffer_binding(),
+                        ),
+                    },
+                    BindGroupEntry {
+                        binding: 2,
+                        resource: BindingResource::Buffer(
+                            cell_states_buffers[1].as_entire_buffer_binding(),
+                        ),
+                    },
+                ],
+            }),
+            device.create_bind_group(&BindGroupDescriptor {
+                label: None,
+                layout: &bind_group_layout,
+                entries: &[
+                    BindGroupEntry {
+                        binding: 0,
+                        resource: BindingResource::Buffer(
+                            uniform_buffer.as_entire_buffer_binding(),
+                        ),
+                    },
+                    BindGroupEntry {
+                        binding: 1,
+                        resource: BindingResource::Buffer(
+                            cell_states_buffers[1].as_entire_buffer_binding(),
+                        ),
+                    },
+                    BindGroupEntry {
+                        binding: 2,
+                        resource: BindingResource::Buffer(
+                            cell_states_buffers[0].as_entire_buffer_binding(),
+                        ),
+                    },
+                ],
+            }),
+        ];
+
+        let pipeline_layout = device.create_pipeline_layout(&PipelineLayoutDescriptor {
+            label: None,
+            bind_group_layouts: &[&bind_group_layout],
+            push_constant_ranges: &[],
+        });
+        let cell_pipeline = device.create_render_pipeline(&RenderPipelineDescriptor {
+            vertex: VertexState {
+                module: &shader,
+                entry_point: "vertexMain",
+                buffers: &[vertex_buffer_layout],
+                compilation_options: PipelineCompilationOptions::default(),
+            },
+            fragment: Some(FragmentState {
+                module: &shader,
+                entry_point: "fragmentMain",
+                targets: &[Some(ColorTargetState {
+                    format: surface_config.format,
+                    blend: Some(BlendState::REPLACE),
+                    write_mask: ColorWrites::ALL,
+                })],
+                compilation_options: PipelineCompilationOptions::default(),
+            }),
+            layout: Some(&pipeline_layout),
+            primitive: PrimitiveState::default(),
+            label: None,
+            depth_stencil: None,
+            multisample: MultisampleState::default(),
+            multiview: None,
+        });
+        let simulation_pipeline = device.create_compute_pipeline(&ComputePipelineDescriptor {
+            label: None,
+            layout: Some(&pipeline_layout),
+            module: &simulator,
+            entry_point: "main",
+            compilation_options: Default::default(),
+        });
 
         Ok(Self {
             surface,
@@ -92,6 +287,14 @@ impl<'a> State<'a> {
                 b: 0.2,
                 a: 1.0,
             },
+            vertex_buffer,
+            cell_pipeline,
+            simulation_pipeline,
+            grid_size,
+            bind_groups,
+            selected_bind: 0,
+            last_time: Instant::now(),
+            compute_delay: Duration::from_millis(8),
         })
     }
 
@@ -106,7 +309,32 @@ impl<'a> State<'a> {
         false
     }
 
-    fn update(&mut self) {}
+    fn update(&mut self) {
+        let now = Instant::now();
+        if now - self.last_time < self.compute_delay {
+            return;
+        }
+
+        self.last_time = now;
+
+        let mut encoder = self
+            .device
+            .create_command_encoder(&CommandEncoderDescriptor::default());
+
+        {
+            let mut compute_pass = encoder.begin_compute_pass(&ComputePassDescriptor::default());
+
+            compute_pass.set_pipeline(&self.simulation_pipeline);
+            compute_pass.set_bind_group(0, &self.bind_groups[self.selected_bind], &[]);
+
+            let workgroup_count = (self.grid_size as f32 / 8.0).ceil() as _;
+            compute_pass.dispatch_workgroups(workgroup_count, workgroup_count, 1);
+        }
+
+        self.queue.submit([encoder.finish()]);
+
+        self.selected_bind ^= 1;
+    }
 
     fn render(&mut self) -> Result<(), SurfaceError> {
         let output = self.surface.get_current_texture()?;
@@ -131,6 +359,14 @@ impl<'a> State<'a> {
                 })],
                 ..Default::default()
             });
+
+            render_pass.set_pipeline(&self.cell_pipeline);
+            render_pass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
+            render_pass.set_bind_group(0, &self.bind_groups[self.selected_bind], &[]);
+            render_pass.draw(
+                0..(VERTICES.len() as u32 / 2),
+                0..(self.grid_size * self.grid_size) as _,
+            );
         }
 
         self.queue.submit([encoder.finish()]);
